@@ -1,0 +1,5 @@
+requests>=2.31.0
+Pillow>=10.0.0
+astral>=3.2
+PyYAML>=6.0
+numpy>=1.24.0

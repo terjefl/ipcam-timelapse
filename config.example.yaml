@@ -1,0 +1,187 @@
+# Eksempelkonfigurasjon for ipcam-timelapse.
+#
+# Kopier denne filen til config.yaml og fyll inn egne verdier:
+#     cp config.example.yaml config.yaml
+#
+# config.yaml inneholder passord og tokens og skal ALDRI sjekkes inn i Git.
+# Alle <VERDIER I VINKELPARENTES> må erstattes før første kjøring.
+# IP-adressene under (192.0.2.x) er dokumentasjonsadresser og må byttes ut.
+#
+# Filen lastes automatisk på nytt hvert 30. sekund — endringer krever ikke omstart.
+
+global:
+  timezone: Europe/Oslo   # IANA-sone; styrer klokkeslett, sol-tider og døgnrotasjon av logger
+  health_port: 8080       # HTTP-port for helsesjekk (GET / gir status for alle kameraer)
+  pushover:
+    enabled: false        # true = send varsler (stall_alert og fokus) via Pushover
+    token: "<PUSHOVER_APP_TOKEN>"   # App-token fra pushover.net (Your Applications)
+    user: "<PUSHOVER_USER_KEY>"     # User key fra forsiden på pushover.net
+
+cameras:
+  # --- Kamera 1: PTZ-kamera med preset og fokusovervåking ---
+  - name: CAM1-PTZ         # Kameranavn; brukes i logger, varsler og filnavn
+    # Snapshot-URL. Eksempelet er Reolink-syntaks; andre merker bruker egne URL-er.
+    # rs= er en tilfeldig streng kameraet krever for å unngå caching.
+    url: "http://192.0.2.10/cgi-bin/api.cgi?cmd=Snap&channel=0&rs=<TILFELDIG_STRENG>&user=<BRUKERNAVN>&password=<PASSORD>"
+    root_folder: /images/CAM1-PTZ   # Lagringsmappe i containeren (bilder + undermappen timelapse/)
+    interval_minutes: 1     # Ta bilde hvert N-te minutt
+    mode: continuous          # continuous = kjør døgnet rundt | sunrise_to_sunset = kjør kun mellom soloppgang og solnedgang
+    save_daylight_only: true # true = ikke lagre bilder etter solnedgang og før soloppgang
+    latitude: 60.00           # Breddegrad for beregning av sol-tider
+    longitude: 9.29           # Lengdegrad for beregning av sol-tider
+    sunrise_offset_minutes: -60   # Negativ = start tidligere enn soloppgang
+    sunset_offset_minutes: 60     # Positiv = stopp senere enn solnedgang
+
+    timestamp:              # Tidsstempel brent inn i bildet
+      horizontal: center    # left | center | right
+      vertical: bottom      # top | bottom
+      date_format: "%d.%m.%Y %H:%M:%S"   # Python strftime-format, eksempler:
+      # "%d.%m.%Y %H:%M:%S"  →  01.04.2026 14:32:05
+      # "%Y-%m-%d %H:%M:%S"  →  2026-04-01 14:32:05
+      # "%d.%m %H:%M"        →  01.04 14:32
+      # "%H:%M:%S"           →  14:32:05
+
+    ftp:                    # Opplasting av siste bilde og timelapse til webserver
+      enabled: false        # true = last opp via FTP
+      host: 192.0.2.20
+      port: 21
+      username: <FTP_BRUKERNAVN>
+      password: <FTP_PASSORD>
+      folder: /CAM1-PTZ             # Alle filer lastes opp til denne mappen
+      latest_filename: CAM1-PTZ.jpg # Filnavn for siste bilde (overskrives)
+      hourly_filename: CAM1-PTZ-timelapse_rolling.mp4  # Overskrives hver time
+      # Dagstimelapse: {kameranavn}_{ukedag}.mp4 — eks. CAM1-PTZ_mandag.mp4
+
+    timelapse:
+      enabled: true       # true = generer timelapse-video
+      fps: 10             # Bilder per sekund i ferdig video; høyere = raskere avspilling
+      rolling_hours: 4    # Rullerende video dekker de siste N timene
+      crf: 23             # H.264 kvalitet: 0=lossless, 51=lavest; lavere = bedre kvalitet/større fil
+
+    camera:               # Pålogging for PTZ-styring (preset og zoom) via kameraets API
+      ip: "192.0.2.10"
+      username: <BRUKERNAVN>
+      password: <PASSORD>
+      channel: 0          # Kanalnummer i kameraet; 0 for enkeltkamera
+
+    ptz:                  # Fjern hele blokken for kameraer uten PTZ
+      preset_id: 1        # Preset-nummer lagret i kameraet (Reolink-app / webgrensesnitt)
+      settle_seconds: 5   # Ventetid etter preset-kall før bilde tas
+      override_minutes: 10    # Tving preset etter N min uten bilde (selv om kamera er i manuell posisjon); 0 = aldri override
+      image_check: true      # Hopp over capture hvis bildet ser annerledes ut enn referanse (manuell bruk)
+      image_similarity_threshold: 0.70  # Pearson-korrelasjon; lavere = mer tolerant for endringer
+      image_check_min_std: 8.0   # Er bildet nesten svart (stddev under denne) kan ikke posisjonen bedømmes; preset kjøres uansett
+
+    stall_alert:
+      enabled: true         # true = varsle via Pushover hvis bildetaking stopper
+      minutes: 5            # varsle hvis ingen bilder på N minutter
+
+    dark_cleanup:
+      enabled: true         # true = slett mørke bilder automatisk
+      run_at: "12:00"        # tidspunkt for kjøring (HH:MM)
+      lookback_hours: 24     # sjekk bilder de siste N timene
+      darkness_threshold: 30 # pikselverdi-terskel (0-255); piksler under denne regnes som mørke
+      dark_percent_limit: 98.5 # andel mørke piksler (%) som kreves for å slette bildet
+
+    focus:
+      enabled: true            # true = overvåk om bildet er uskarpt
+      interval_minutes: 5      # sjekk fokus hvert N-te minutt
+      focus_threshold: 20.0    # Laplacian-varians; under denne = uskarp
+      light_threshold: 30.0    # lysnivå under denne = natt, hopp over sjekk
+      confirm_cycles: 2        # antall påfølgende uskarpe frames før varsel/jiggle
+      alert_only: true         # true = kun varsle; false = kjør zoom-jiggle ved uskarphet
+      visibility_threshold: 20  # histogram-stddev under denne = tåke/dis/motlys, hopp over fokussjekk (0 = deaktivert; typisk 20–30)
+      roi_fraction: 0.6          # bruk sentrum N% av bildet for fokussjekk (1.0 = hele bildet)
+      min_sun_elevation: 3       # hopp over fokussjekk når solen står lavere enn N grader (morgen og kveld); 0 = deaktivert
+      colour_threshold: 2.0      # fargemetning under denne = kameraet står i svart/hvitt nattmodus (IR), hopp over sjekk
+      exclude_hours: []          # tidsbasert ekskludering, f.eks. [ {start: "07:30", end: "09:30"} ]
+      zoom_normal: 19            # zoom-nivå kameraet settes tilbake til etter jiggle (normal posisjon)
+      zoom_out: 17               # zoom-nivå det midlertidig zoomes ut til for å trigge autofokus
+      camera:                    # Pålogging for fokussjekk og zoom-jiggle
+        ip: "192.0.2.10"
+        username: <BRUKERNAVN>
+        password: <PASSORD>
+        channel: 0               # Kanalnummer i kameraet; 0 for enkeltkamera
+
+    logging:
+      enabled: true          # true = skriv loggfil til disk
+      path: /app/logs        # Loggmappe i containeren; roteres ved midnatt
+      retention_days: 30     # Slett loggfiler eldre enn N dager
+      cleanup_enabled: true  # true = rydd gamle loggfiler automatisk
+
+  # --- Kamera 2: fast kamera uten PTZ ---
+  # Merk: ingen ptz-blokk, og ingen zoom_normal/zoom_out under focus.
+  # Fokusovervåking brukes her kun til varsling (alert_only: true), siden
+  # zoom-jiggle krever et kamera med zoom. Setter du alert_only: false her,
+  # må du også legge til zoom_normal og zoom_out — ellers feiler jiggle.
+  - name: CAM2-FIXED        # Kameranavn; brukes i logger, varsler og filnavn
+    url: "http://192.0.2.11/cgi-bin/api.cgi?cmd=Snap&channel=0&rs=<TILFELDIG_STRENG>&user=<BRUKERNAVN>&password=<PASSORD>"
+    root_folder: /images/CAM2-FIXED   # Lagringsmappe i containeren (bilder + undermappen timelapse/)
+    interval_minutes: 1     # Ta bilde hvert N-te minutt
+    mode: continuous          # continuous = kjør døgnet rundt | sunrise_to_sunset = kjør kun mellom soloppgang og solnedgang
+    save_daylight_only: true # true = ikke lagre bilder etter solnedgang og før soloppgang
+    latitude: 60.00           # Breddegrad for beregning av sol-tider
+    longitude: 9.29           # Lengdegrad for beregning av sol-tider
+    sunrise_offset_minutes: -60   # Negativ = start tidligere enn soloppgang
+    sunset_offset_minutes: 60     # Positiv = stopp senere enn solnedgang
+
+    timestamp:              # Tidsstempel brent inn i bildet
+      horizontal: center    # left | center | right
+      vertical: bottom      # top | bottom
+      date_format: "%d.%m.%Y %H:%M:%S"   # Python strftime-format (se kamera 1 for flere eksempler)
+
+    ftp:                    # Opplasting av siste bilde og timelapse til webserver
+      enabled: false        # true = last opp via FTP
+      host: 192.0.2.20
+      port: 21
+      username: <FTP_BRUKERNAVN>
+      password: <FTP_PASSORD>
+      folder: /CAM2-FIXED             # Alle filer lastes opp til denne mappen
+      latest_filename: CAM2-FIXED.jpg # Filnavn for siste bilde (overskrives)
+      hourly_filename: CAM2-FIXED-timelapse_rolling.mp4  # Overskrives hver time
+      # Dagstimelapse: {kameranavn}_{ukedag}.mp4 — eks. CAM2-FIXED_mandag.mp4
+
+    timelapse:
+      enabled: true       # true = generer timelapse-video
+      fps: 10             # Bilder per sekund i ferdig video; høyere = raskere avspilling
+      rolling_hours: 4    # Rullerende video dekker de siste N timene
+      crf: 23             # H.264 kvalitet: 0=lossless, 51=lavest; lavere = bedre kvalitet/større fil
+
+    stall_alert:
+      enabled: true         # true = varsle via Pushover hvis bildetaking stopper
+      minutes: 10           # varsle hvis ingen bilder på N minutter
+
+    dark_cleanup:
+      enabled: true         # true = slett mørke bilder automatisk
+      run_at: "12:05"        # tidspunkt for kjøring (HH:MM) — forskjøvet fra kamera 1 for å spre lasten
+      lookback_hours: 24     # sjekk bilder de siste N timene
+      darkness_threshold: 30 # pikselverdi-terskel (0-255); piksler under denne regnes som mørke
+      dark_percent_limit: 98.5 # andel mørke piksler (%) som kreves for å slette bildet
+
+    focus:
+      enabled: true            # true = overvåk om bildet er uskarpt
+      interval_minutes: 5      # sjekk fokus hvert N-te minutt
+      focus_threshold: 20.0    # Laplacian-varians; under denne = uskarp
+      light_threshold: 30.0    # lysnivå under denne = natt, hopp over sjekk
+      confirm_cycles: 2        # antall påfølgende uskarpe frames før varsel/jiggle
+      alert_only: true         # true = kun varsle; false = kjør zoom-jiggle ved uskarphet
+      visibility_threshold: 20  # histogram-stddev under denne = tåke/dis/motlys, hopp over fokussjekk (0 = deaktivert; typisk 20–30)
+      roi_fraction: 0.6          # bruk sentrum N% av bildet for fokussjekk (1.0 = hele bildet)
+      min_sun_elevation: 3       # hopp over fokussjekk når solen står lavere enn N grader (morgen og kveld); 0 = deaktivert
+      colour_threshold: 2.0      # fargemetning under denne = kameraet står i svart/hvitt nattmodus (IR), hopp over sjekk
+      exclude_hours: []          # tidsbasert ekskludering, f.eks. [ {start: "07:30", end: "09:30"} ]
+      exclude_sun_azimuth:       # hopp over fokussjekk når solen er i denne sektoren (motlys)
+        azimuth_from: 270        # grader fra nord, 270 = vest
+        azimuth_to: 340          # grader fra nord, 340 = nord-nordvest
+        min_elevation: 5         # hopp kun over når solen er over denne høyden (grader)
+      camera:                    # Pålogging for fokussjekk
+        ip: "192.0.2.11"
+        username: <BRUKERNAVN>
+        password: <PASSORD>
+        channel: 0               # Kanalnummer i kameraet; 0 for enkeltkamera
+
+    logging:
+      enabled: true          # true = skriv loggfil til disk
+      path: /app/logs        # Loggmappe i containeren; roteres ved midnatt
+      retention_days: 30     # Slett loggfiler eldre enn N dager
+      cleanup_enabled: true  # true = rydd gamle loggfiler automatisk
