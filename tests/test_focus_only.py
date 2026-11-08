@@ -150,6 +150,7 @@ def test_health_server_gir_latest_jpg_fra_minnet(monkeypatch):
             assert cam["focus_status"] == "ok"
             assert "focus_detail" in cam
             assert cam["settings"]["save_images"] is False
+            assert cam["ip"] == "192.0.2.15"
     finally:
         server.shutdown()
         timelapse.HealthHandler.workers = []
@@ -210,3 +211,10 @@ def test_zoom_jiggle_bruker_focus_camera(monkeypatch):
     assert kall[1][2]["ZoomFocus"]["pos"] == 24
     assert kall[2][2]["ZoomFocus"]["pos"] == 26
     assert all(u.startswith("http://192.0.2.15/api.cgi?") for u, _, _ in kall)
+
+
+def test_camera_ip_fra_config():
+    assert timelapse.camera_ip({"focus": {"camera": {"ip": "10.0.0.5"}}, "url": "http://10.0.0.9/x"}) == "10.0.0.5"
+    assert timelapse.camera_ip({"camera": {"ip": "10.0.0.6"}}) == "10.0.0.6"
+    assert timelapse.camera_ip({"url": "https://10.0.0.7/cgi-bin/api.cgi?cmd=Snap&user=u&password=p"}) == "10.0.0.7"
+    assert timelapse.camera_ip({}) is None

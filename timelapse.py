@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -283,6 +284,17 @@ def allow_insecure_tls():
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     logging.getLogger("tls").info("verify_tls: false — selvsignerte kamerasertifikater godtas")
+
+
+def camera_ip(cfg: dict) -> str | None:
+    """Kameraets IP/vertsnavn: fra focus.camera, camera (PTZ) eller vertsdelen av snapshot-URL-en."""
+    for block in ((cfg.get("focus") or {}).get("camera"), cfg.get("camera")):
+        if isinstance(block, dict) and block.get("ip"):
+            return str(block["ip"])
+    try:
+        return urllib.parse.urlsplit(cfg.get("url") or "").hostname
+    except ValueError:
+        return None
 
 
 def reolink_post(cam_cfg: dict, query: str, payload: list, timeout: int = 5):
@@ -822,6 +834,8 @@ class CameraWorker:
             "total_captures": self.total_captures,
             "interval_minutes": interval,
             "mode": self.cfg.get("mode", "continuous"),
+            # kameraets IP, så overvåking (infradash) kan koble kameraet til sin egen kameraenhet
+            "ip": camera_ip(self.cfg),
         }
         if self.cfg.get("focus", {}).get("enabled", False):
             d["focus_status"] = self._focus_status(now)

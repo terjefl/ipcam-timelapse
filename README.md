@@ -344,7 +344,8 @@ Tjenesten eksponerer HTTP-endepunkter på konfigurert port (standard `8080`):
 GET /health
 ```
 
-Returnerer JSON med status for alle kameraer. HTTP 200 ved ok/warning/starting, 503 ved error.
+Returnerer JSON med status for alle kameraer. HTTP 200 ved ok/warning/starting, 503 ved error. Hvert kamera har
+`ip` (fra config.yaml, `null` uten), så overvåking kan koble kameraet til riktig enhet.
 
 ### Per-kamera endepunkter
 
