@@ -144,8 +144,10 @@ def redact_secrets(text: str) -> str:
     return _SECRET_PARAM_RE.sub(r"\1***", text)
 
 
-def fetch_image(url, timeout=15):
-    resp = requests.get(url, timeout=timeout, stream=True)
+def fetch_image(url, timeout=15, verify=True):
+    """Henter snapshot. verify=False godtar selvsignert sertifikat (Reolink med HTTPS påskrudd);
+    en omdirigering fra http til https følges av requests."""
+    resp = requests.get(url, timeout=timeout, stream=True, verify=verify)
     resp.raise_for_status()
     return resp.content
 
@@ -268,29 +270,63 @@ def send_pushover(token: str, user: str, title: str, message: str) -> bool:
 # PTZ helper
 # ---------------------------------------------------------------------------
 
-def goto_ptz_preset(cam_cfg: dict, preset_id: int, speed: int = 32):
-    """Beveger PTZ-kamera til en lagret preset-posisjon via Reolink JSON-API."""
-    ip = cam_cfg["ip"]
-    login_url = f"http://{ip}/api.cgi?cmd=Login&token=null"
-    login_payload = [{"cmd": "Login", "action": 0, "param": {
+_INSECURE_TLS_WARNED = False
+
+
+def allow_insecure_tls():
+    """Demper urllib3-advarselen om uverifisert sertifikat. Kalles når et kamera har verify_tls: false,
+    så loggen ikke fylles med samme advarsel for hvert bilde."""
+    global _INSECURE_TLS_WARNED
+    if _INSECURE_TLS_WARNED:
+        return
+    _INSECURE_TLS_WARNED = True
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    logging.getLogger("tls").info("verify_tls: false — selvsignerte kamerasertifikater godtas")
+
+
+def reolink_post(cam_cfg: dict, query: str, payload: list, timeout: int = 5):
+    """POST til Reolink JSON-API (api.cgi). Kamerablokken kan ha:
+      https: true        — gå rett på https i stedet for http
+      verify_tls: false  — godta kameraets selvsignerte sertifikat
+    Kameraer med «HTTPS-omdirigering» svarer 301/302 på http. requests ville da gjort kallet om
+    til GET, så omdirigeringen håndteres her: samme POST sendes på nytt over https."""
+    verify = cam_cfg.get("verify_tls", True)
+    if not verify:
+        allow_insecure_tls()
+    scheme = "https" if cam_cfg.get("https", False) else "http"
+    url = f"{scheme}://{cam_cfg['ip']}/api.cgi?{query}"
+    resp = requests.post(url, json=payload, timeout=timeout, allow_redirects=False, verify=verify)
+    if resp.status_code in (301, 302, 307, 308) and url.startswith("http://"):
+        resp = requests.post(url.replace("http://", "https://", 1), json=payload,
+                             timeout=timeout, allow_redirects=False, verify=verify)
+    return resp
+
+
+def reolink_login(cam_cfg: dict) -> str:
+    payload = [{"cmd": "Login", "action": 0, "param": {
         "User": {"userName": cam_cfg["username"], "password": cam_cfg["password"]}
     }}]
-    token = requests.post(login_url, json=login_payload, timeout=5).json()[0]["value"]["Token"]["name"]
+    return reolink_post(cam_cfg, "cmd=Login&token=null", payload).json()[0]["value"]["Token"]["name"]
+
+
+def reolink_logout(cam_cfg: dict, token: str):
+    reolink_post(cam_cfg, f"cmd=Logout&token={token}", [{"cmd": "Logout", "action": 0, "param": {}}])
+
+
+def goto_ptz_preset(cam_cfg: dict, preset_id: int, speed: int = 32):
+    """Beveger PTZ-kamera til en lagret preset-posisjon via Reolink JSON-API."""
+    token = reolink_login(cam_cfg)
     try:
-        ptz_url = f"http://{ip}/api.cgi?token={token}"
         ptz_payload = [{"cmd": "PtzCtrl", "action": 0, "param": {
             "channel": cam_cfg.get("channel", 0),
             "op": "ToPos",
             "id": preset_id,
             "speed": speed,
         }}]
-        requests.post(ptz_url, json=ptz_payload, timeout=5)
+        reolink_post(cam_cfg, f"token={token}", ptz_payload)
     finally:
-        requests.post(
-            f"http://{ip}/api.cgi?cmd=Logout&token={token}",
-            json=[{"cmd": "Logout", "action": 0, "param": {}}],
-            timeout=5,
-        )
+        reolink_logout(cam_cfg, token)
 
 
 # ---------------------------------------------------------------------------
@@ -680,12 +716,25 @@ class CameraWorker:
         self._focus_inactive_reason: str | None = None  # settes av siste fokussjekk
         self._last_skip: datetime | None = None         # siste planlagte hopp (PTZ i manuell posisjon)
         self._skip_reason: str | None = None
+        self._latest_image: bytes | None = None         # siste bilde i minnet; eneste kopi ved save_images: false
+
+    def saves_images(self) -> bool:
+        """save_images: false = fokus-bare-kamera: bildet tas og fokussjekkes, men lagres ikke,
+        og verken timelapse, FTP eller mørk-opprydding kjøres."""
+        return self.cfg.get("save_images", True)
+
+    def _snapshot_verify(self) -> bool:
+        verify = self.cfg.get("verify_tls", True)
+        if not verify:
+            allow_insecure_tls()
+        return verify
 
     def _mode_sig(self) -> tuple:
         """Fingeravtrykk av feltene som påvirker modus-logging."""
         return (
             self.cfg.get("mode", "continuous"),
             self.cfg.get("save_daylight_only", False),
+            self.cfg.get("save_images", True),
             self.cfg.get("latitude"),
             self.cfg.get("longitude"),
             self.cfg.get("sunrise_offset_minutes", 0),
@@ -719,6 +768,10 @@ class CameraWorker:
                 self.log.info("Modus: soloppgang til solnedgang — mangler koordinater")
         else:
             self.log.info("Modus: kontinuerlig")
+
+        if not self.saves_images():
+            self.log.info("Kun fokussjekk (save_images: false) — bildene lagres ikke, ingen timelapse eller FTP")
+            return
 
         if self.cfg.get("save_daylight_only", False):
             self.log.info("Kun dagslysbilder lagres (save_daylight_only: true)")
@@ -785,6 +838,7 @@ class CameraWorker:
 
         fc = self.cfg.get("focus", {})
         d["settings"] = {
+            "save_images": self.saves_images(),
             "save_daylight_only": self.cfg.get("save_daylight_only", False),
             "ptz":        self.cfg.get("ptz", {}).get("preset_id") is not None,
             "timelapse":  self.cfg.get("timelapse", {}).get("enabled", False),
@@ -877,7 +931,7 @@ class CameraWorker:
                 if (ptz.get("image_check", False) and not overdue
                         and self._ptz_ref_image is not None):
                     try:
-                        probe = fetch_image(self.cfg["url"])
+                        probe = fetch_image(self.cfg["url"], verify=self._snapshot_verify())
                         sim_threshold = ptz.get("image_similarity_threshold", 0.90)
                         similar, corr = images_similar(
                             self._ptz_ref_image, probe, sim_threshold,
@@ -908,7 +962,7 @@ class CameraWorker:
                     self.log.warning("PTZ preset-kall feilet: %s", exc)
 
             self.log.info("Fetching image...")
-            image_bytes = fetch_image(self.cfg["url"])
+            image_bytes = fetch_image(self.cfg["url"], verify=self._snapshot_verify())
             raw_image_bytes = image_bytes  # bevart for PTZ-referanse (uten tidsstempel)
 
             # Fokussjekken setter kun status/varsler — bildet lagres uansett.
@@ -917,6 +971,13 @@ class CameraWorker:
                     self._run_focus_check(image_bytes, now)
                 except Exception as exc:
                     self.log.warning("Fokussjekk feilet, fortsetter opptak: %s", exc)
+
+            if not self.saves_images():
+                # Fokus-bare-kamera: bare siste bilde i minnet (til /camera/<navn>/latest.jpg)
+                self._latest_image = image_bytes
+                self._mark_capture(now, raw_image_bytes)
+                self.log.debug("Kun fokussjekk — bildet lagres ikke")
+                return
 
             ts_cfg = self.cfg.get("timestamp", {})
             ts_str = now.strftime(ts_cfg.get("date_format", "%d.%m.%Y %H:%M:%S"))
@@ -930,6 +991,7 @@ class CameraWorker:
 
             save_daily = not (self.cfg.get("save_daylight_only", False) and not self._is_daylight(now))
             save_image(image_bytes, self.cfg["root_folder"], now, save_daily=save_daily)
+            self._latest_image = image_bytes
             if save_daily:
                 self.log.info("Saved — %s", self.cfg["root_folder"])
             else:
@@ -943,22 +1005,26 @@ class CameraWorker:
                 except Exception as exc:
                     self.log.error("FTP upload failed: %s", exc)
 
-
-            self.last_capture = now
-            self.last_error = None
-            self.consecutive_failures = 0
-            self.total_captures += 1
-            if self.cfg.get("ptz", {}).get("preset_id") is not None:
-                self._last_successful_ptz_capture = now
-                if self.cfg["ptz"].get("image_check", False):
-                    self._ptz_ref_image = raw_image_bytes
+            self._mark_capture(now, raw_image_bytes)
 
         except Exception as exc:
             self.consecutive_failures += 1
             self.last_error = redact_secrets(str(exc))
             self.log.error("Capture failed (%d in a row): %s", self.consecutive_failures, self.last_error)
 
+    def _mark_capture(self, now: datetime, raw_image_bytes: bytes):
+        self.last_capture = now
+        self.last_error = None
+        self.consecutive_failures = 0
+        self.total_captures += 1
+        if self.cfg.get("ptz", {}).get("preset_id") is not None:
+            self._last_successful_ptz_capture = now
+            if self.cfg["ptz"].get("image_check", False):
+                self._ptz_ref_image = raw_image_bytes
+
     def check_timelapse(self, now: datetime):
+        if not self.saves_images():
+            return
         _, sunset = self._sun_times(now)
         save_daylight_only = self.cfg.get("save_daylight_only", False)
         self.timelapse.check(now, sunset,
@@ -966,6 +1032,8 @@ class CameraWorker:
                              is_daylight=self._is_daylight(now))
 
     def check_dark_cleanup(self, now: datetime):
+        if not self.saves_images():
+            return
         self.dark_cleaner.cam_cfg = self.cfg
         self.dark_cleaner.check(now)
 
@@ -1007,16 +1075,9 @@ class CameraWorker:
 
     def _zoom_jiggle(self):
         fc = self.cfg["focus"]["camera"]
-        ip = fc["ip"]
         token = None
         try:
-            login_payload = [{"cmd": "Login", "action": 0, "param": {
-                "User": {"userName": fc["username"], "password": fc["password"]}
-            }}]
-            token = requests.post(
-                f"http://{ip}/api.cgi?cmd=Login&token=null",
-                json=login_payload, timeout=5,
-            ).json()[0]["value"]["Token"]["name"]
+            token = reolink_login(fc)
 
             zoom_normal = self.cfg["focus"]["zoom_normal"]
             zoom_out = self.cfg["focus"]["zoom_out"]
@@ -1024,13 +1085,9 @@ class CameraWorker:
             self.log.warning("ZOOM JIGGLE — ut til %d, tilbake til %d", zoom_out, zoom_normal)
 
             def sett_zoom(pos):
-                requests.post(
-                    f"http://{ip}/api.cgi?token={token}",
-                    json=[{"cmd": "StartZoomFocus", "action": 0, "param": {
-                        "ZoomFocus": {"channel": channel, "op": "ZoomPos", "pos": pos}
-                    }}],
-                    timeout=5,
-                )
+                reolink_post(fc, f"token={token}", [{"cmd": "StartZoomFocus", "action": 0, "param": {
+                    "ZoomFocus": {"channel": channel, "op": "ZoomPos", "pos": pos}
+                }}])
 
             sett_zoom(zoom_out)
             time.sleep(3)
@@ -1038,15 +1095,11 @@ class CameraWorker:
             time.sleep(3)
             self.log.warning("ZOOM JIGGLE FERDIG")
         except Exception as exc:
-            self.log.error("Feil ved zoom-jiggle: %s", exc)
+            self.log.error("Feil ved zoom-jiggle: %s", redact_secrets(str(exc)))
         finally:
             if token:
                 try:
-                    requests.post(
-                        f"http://{ip}/api.cgi?cmd=Logout&token={token}",
-                        json=[{"cmd": "Logout", "action": 0, "param": {}}],
-                        timeout=5,
-                    )
+                    reolink_logout(fc, token)
                 except Exception:
                     pass
 
@@ -1200,10 +1253,13 @@ class CameraWorker:
             self._recover_streak = 0
             if self._blur_since is None:
                 self._blur_since = now
-            _BLUR_SEEN[self.name] = now
 
             # --- Kryss-kamera: flere kameraer uskarpe samtidig er vær, ikke linse ---
+            # weather_window_minutes: 0 holder kameraet helt utenfor: det verken bruker eller
+            # bidrar til sammenligningen (et kamera som ser en annen vei sier lite om de andres sikt).
             window = fc.get("weather_window_minutes", 15)
+            if window > 0:
+                _BLUR_SEEN[self.name] = now
             others = [n for n, t in _BLUR_SEEN.items()
                       if n != self.name and (now - t) <= timedelta(minutes=window)]
             if window > 0 and others:
@@ -1369,6 +1425,9 @@ function buildTags(s) {
     return '<span class="tag ' + (on ? 'tag-on' : 'tag-off') + '" title="' + (title || '') + '">' + label + '</span>';
   }
   var t = '';
+  if (s.save_images === false) {
+    t += tag('kun fokus', true, 'Bildene lagres ikke: kameraet fokussjekkes bare (save_images: false)');
+  }
   t += tag('dagslys', s.save_daylight_only, 'Kun dagslysbilder lagres (soloppgang til solnedgang)');
   t += tag('PTZ', s.ptz, 'Kamera beveges til fast preset-posisjon før hvert bilde');
   t += tag('timelapse', s.timelapse, 'Genererer rullende timelapse-video hver time');
@@ -1634,12 +1693,16 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        image_path = Path(worker.cfg["root_folder"]) / "latest.jpg"
-        if not image_path.exists():
-            self.send_response(404)
-            self.end_headers()
-            return
-        data = image_path.read_bytes()
+        data = worker._latest_image
+        if data is None:
+            # Ikke tatt bilde siden oppstart: fall tilbake til disk (ikke for fokus-bare-kameraer)
+            root = worker.cfg.get("root_folder")
+            image_path = Path(root) / "latest.jpg" if root else None
+            if image_path is None or not image_path.exists():
+                self.send_response(404)
+                self.end_headers()
+                return
+            data = image_path.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", "image/jpeg")
         self.send_header("Content-Length", str(len(data)))

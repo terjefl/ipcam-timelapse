@@ -18,6 +18,8 @@ Docker-basert tjeneste for automatisk bildeopptak og timelapse-generering fra IP
 - Pushover-varsler ved stans i opptak
 - Health check HTTP-endepunkt (`/health`)
 - Automatisk config-reload uten omstart
+- Fokus-bare-kameraer (`save_images: false`): bare fokussjekk og zoom-jiggle, ingen lagring, timelapse eller FTP
+- Snapshot og Reolink-API over https med selvsignert sertifikat (`verify_tls: false`)
 
 ## Filstruktur
 
@@ -29,6 +31,7 @@ ipcam-timelapse/
 ├── Dockerfile
 ├── requirements.txt
 ├── deploy/compose.yml     # Mal for compose med ferdigbygd image fra ghcr.io
+├── tests/                 # pytest; kjøres i Actions før imaget bygges
 └── .github/workflows/     # Bygger og publiserer imaget ved push til main
 ```
 
@@ -106,7 +109,14 @@ cameras:
     longitude: 9.29
     sunrise_offset_minutes: -60   # Juster soloppgang (negativt = start tidligere)
     sunset_offset_minutes: 60     # Juster solnedgang (positivt = stopp senere)
+    verify_tls: true          # false = godta kameraets selvsignerte sertifikat på snapshot-URL-en
+    save_images: true         # false = fokus-bare-kamera, se eget avsnitt
 ```
+
+**`verify_tls: false`** trengs når kameraet har HTTPS påskrudd (Reolink: «HTTPS» i nettverksinnstillingene).
+Snapshot-URL-en kan da peke rett på `https://`, eller på `http://` og følge omdirigeringen; begge deler virker.
+Sertifikatet er selvsignert, så verifiseringen må slås av. Samme nøkkel finnes i `camera`-blokkene for
+Reolink-API-et (PTZ og zoom-jiggle), se nedenfor.
 
 #### Tidsstempel
 
@@ -156,6 +166,8 @@ Brukes for Reolink PTZ-kameraer. Tjenesten beveger kameraet til en lagret preset
       username: admin
       password: passord
       channel: 0
+      https: false             # true = gå rett på https (ellers http, med omdirigering om kameraet krever det)
+      verify_tls: true         # false = godta selvsignert sertifikat
 
     ptz:
       preset_id: 12            # Preset-nummer lagret i kameraet
@@ -203,6 +215,8 @@ Analyserer bildeskarpheten, retter fokus selv med zoom-jiggle, og varsler først
         username: admin
         password: passord
         channel: 0
+        https: false               # true = gå rett på https
+        verify_tls: true           # false = godta selvsignert sertifikat
 ```
 
 **Forløp ved uskarphet.** Én måling under terskelen gjør ingenting. Først når bildet har vært uskarpt i
@@ -216,7 +230,9 @@ i `recover_cycles` sjekker på rad, så lett dis ikke gir vipping fram og tilbak
 
 **Vær, ikke linse** (`weather_window_minutes`): Er flere kameraer uskarpe innenfor samme vindu, regnes det som
 tåke eller dis, status blir `inaktiv (dårlig sikt (flere kameraer))` og ingenting gjøres. Ingen linse mister fokus
-på to kameraer samtidig.
+på to kameraer samtidig. Sammenligningen forutsetter at kameraene ser omtrent samme vær: et kamera på et annet
+sted eller som ser en annen vei bør ha `weather_window_minutes: 0`. Da holdes det helt utenfor, og hverken bruker
+eller bidrar til de andres vurdering.
 
 **Siktsjekk** (`visibility_threshold`): Lavt standardavvik på histogrammet betyr et uniformt, flatt bilde — typisk tåke, dis eller motlys. Fokussjekken hoppes da over for å unngå falske varsler. Typiske verdier: klart vær ~40–80, lett dis ~20–35, tett tåke <15.
 
@@ -227,6 +243,51 @@ på to kameraer samtidig.
 **Solhøyde** (`min_sun_elevation`): Rett etter soloppgang og før solnedgang gir lavt lys og morgentåke lave skarphetsverdier uten at linsen er ute av fokus. Sjekken hoppes over når solen står lavere enn N grader, symmetrisk morgen og kveld. Erfaringsverdi: stabile målinger fra ca. 2–3°. Ved 60°N står solen 6,6° over horisonten midt på dagen 21. desember, så 3° stenger ikke vinteren.
 
 **Fokussjekk deaktiveres automatisk** etter solnedgang (styrt av `latitude`/`longitude`), ved lav sol, i nattmodus samt i konfigurerte tidsvinduer. Årsaken vises som `inaktiv (…)` i `/health` og på dashbordet.
+
+#### Fokus-bare-kamera (`save_images: false`)
+
+For kameraer som bare skal overvåkes for fokus og rettes med zoom-jiggle, uten timelapse. Bildet hentes som
+vanlig, fokussjekken kjører som vanlig (med zoom-jiggle når `alert_only: false`), men ingenting skrives til disk:
+ingen `root_folder`, ingen dagsmapper, ingen timelapse, ingen FTP og ingen mørk-opprydding. Siste bilde holdes i
+minnet og vises på dashbordet og under `/camera/<navn>/latest.jpg`. `/health` gir `status`, `last_capture`,
+`focus_status` og `focus_detail` som for andre kameraer, `/health/<navn>/focus` virker, og `stall_alert` gjelder
+som før (et bilde som ikke lot seg hente teller som stans).
+
+```yaml
+  - name: VEI
+    url: "https://10.0.0.15/cgi-bin/api.cgi?cmd=Snap&channel=0&rs=abc123&user=admin&password=passord"
+    verify_tls: false          # selvsignert sertifikat på kameraet
+    save_images: false         # bare fokussjekk, ingen lagring
+    interval_minutes: 1        # hent bilde hvert minutt (fokussjekken styres av focus.interval_minutes)
+    latitude: 60.00            # for natt, solhøyde og solsektor
+    longitude: 9.29
+    stall_alert:
+      enabled: true
+      minutes: 10
+    focus:
+      enabled: true
+      interval_minutes: 1
+      focus_threshold: 50.0
+      confirm_cycles: 2
+      confirm_minutes: 2
+      alert_only: false
+      visibility_threshold: 20
+      roi_fraction: 0.6
+      weather_window_minutes: 0    # ser en annen vei enn de andre kameraene
+      exclude_sun_azimuth: {azimuth_from: 270, azimuth_to: 340, min_elevation: 5}
+      notify: false                # status leses av overvåkingen via /health i stedet
+      zoom_normal: 26
+      zoom_out: 24
+      camera:
+        ip: "10.0.0.15"
+        username: admin
+        password: passord
+        channel: 0
+        verify_tls: false
+```
+
+`mode`, `save_daylight_only`, `timestamp`, `ftp`, `timelapse` og `dark_cleanup` ignoreres for et slikt kamera.
+Vil du at kameraet skal hvile om natten, sett `mode: sunrise_to_sunset`; fokussjekken er uansett inaktiv utenfor dagslys.
 
 #### Stall-varsel (Pushover)
 
@@ -292,6 +353,7 @@ GET /health/{name}           — Overall status for kameraet
 GET /health/{name}/capture   — Kun bildestatus (tar kameraet bilder?)
 GET /health/{name}/ftp       — FTP-opplasting (feiler siste opplasting?)
 GET /health/{name}/focus     — Fokus-status (kun kameraer med focus: enabled: true)
+GET /camera/{name}/latest.jpg — Siste bilde (fra minnet; fra disk før første bilde etter omstart)
 ```
 
 Alle returnerer `200 OK` eller `503 Service Unavailable` med en kort tekstmelding — egnet for Uptime Kuma og lignende overvåkingsverktøy.
@@ -352,7 +414,8 @@ config.yaml
 ## Image, bygg og utvikling
 
 GitHub Actions bygger `ghcr.io/terjefl/ipcam-timelapse:latest` og `:sha-<kort>` ved push til `main`
-(offentlig pakke). Syntaks- og importsjekk kjører først, så et ødelagt image ikke publiseres.
+(offentlig pakke). Syntaks- og importsjekk og testene i `tests/` kjører først, så et ødelagt image ikke publiseres.
+Lokalt: `pip install -r requirements.txt pytest && pytest`.
 `config.yaml` trenger aldri nytt image: den leses på nytt hvert 30. sekund.
 
 Oppdater en kjørende installasjon ved å trekke nytt image og starte containeren på nytt

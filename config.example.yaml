@@ -27,6 +27,8 @@ cameras:
     interval_minutes: 1     # Ta bilde hvert N-te minutt
     mode: continuous          # continuous = kjør døgnet rundt | sunrise_to_sunset = kjør kun mellom soloppgang og solnedgang
     save_daylight_only: true # true = ikke lagre bilder etter solnedgang og før soloppgang
+    save_images: true        # false = fokus-bare-kamera (se kamera 3): ingen lagring, timelapse eller FTP
+    verify_tls: true         # false = godta kameraets selvsignerte sertifikat når snapshot-URL-en er https
     latitude: 60.00           # Breddegrad for beregning av sol-tider
     longitude: 9.29           # Lengdegrad for beregning av sol-tider
     sunrise_offset_minutes: -60   # Negativ = start tidligere enn soloppgang
@@ -63,6 +65,8 @@ cameras:
       username: <BRUKERNAVN>
       password: <PASSORD>
       channel: 0          # Kanalnummer i kameraet; 0 for enkeltkamera
+      https: false        # true = kall API-et rett på https; false = http, og følg omdirigering om kameraet krever https
+      verify_tls: true    # false = godta selvsignert sertifikat
 
     ptz:                  # Fjern hele blokken for kameraer uten PTZ
       preset_id: 1        # Preset-nummer lagret i kameraet (Reolink-app / webgrensesnitt)
@@ -201,3 +205,55 @@ cameras:
       path: /app/logs        # Loggmappe i containeren; roteres ved midnatt
       retention_days: 30     # Slett loggfiler eldre enn N dager
       cleanup_enabled: true  # true = rydd gamle loggfiler automatisk
+
+  # --- Kamera 3: fokus-bare-kamera (save_images: false) ---
+  # Bildet hentes og fokussjekkes, og zoom-jiggle retter fokus, men ingenting lagres: ingen root_folder,
+  # ingen timelapse, FTP eller mørk-opprydding. Siste bilde holdes i minnet for dashbordet og
+  # /camera/<navn>/latest.jpg. /health gir status og focus_status som for de andre kameraene.
+  # Kameraet har HTTPS påskrudd med selvsignert sertifikat, derfor https i URL-en og verify_tls: false.
+  - name: CAM3-FOCUS
+    url: "https://192.0.2.15/cgi-bin/api.cgi?cmd=Snap&channel=0&rs=<TILFELDIG_STRENG>&user=<BRUKERNAVN>&password=<PASSORD>"
+    verify_tls: false       # kameraets sertifikat er selvsignert
+    save_images: false      # bare fokussjekk
+    interval_minutes: 1     # Hent bilde hvert minutt; selve fokussjekken styres av focus.interval_minutes
+    latitude: 60.00         # For natt (soloppgang/solnedgang), solhøyde og solsektor
+    longitude: 9.29
+
+    stall_alert:
+      enabled: true         # varsle hvis bildehentingen stopper (Pushover må være satt opp i global)
+      minutes: 10
+
+    focus:
+      enabled: true
+      interval_minutes: 1      # sjekk fokus hvert minutt
+      focus_threshold: 50.0    # Laplacian-varians; under denne = uskarp
+      light_threshold: 30.0
+      confirm_cycles: 2        # to uskarpe sjekker på rad ...
+      confirm_minutes: 2       # ... over minst to minutter før det regnes som bekreftet
+      alert_only: false        # kjør zoom-jiggle
+      jiggle_wait_minutes: 10
+      jiggle_max_per_day: 4
+      unfixed_after_minutes: 60
+      visibility_threshold: 20 # tåke/dis/motlys: hopp over
+      roi_fraction: 0.6
+      min_sun_elevation: 3
+      weather_window_minutes: 0  # ser en annen vei enn de andre kameraene: ikke del av værsjekken på tvers
+      exclude_sun_azimuth:       # motlys når solen står i vest til nord-nordvest
+        azimuth_from: 270
+        azimuth_to: 340
+        min_elevation: 5
+      notify: false            # ingen Pushover; overvåkingen leser /health i stedet
+      zoom_normal: 26
+      zoom_out: 24
+      camera:
+        ip: "192.0.2.15"
+        username: <BRUKERNAVN>
+        password: <PASSORD>
+        channel: 0
+        verify_tls: false      # samme selvsignerte sertifikat for API-kallene (zoom-jiggle)
+
+    logging:
+      enabled: true
+      path: /app/logs
+      retention_days: 30
+      cleanup_enabled: true

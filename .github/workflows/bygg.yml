@@ -20,11 +20,13 @@ jobs:
         with:
           python-version: "3.12"
       - name: installer
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt pytest
       - name: kompiler og importer
         run: |
           python -m py_compile timelapse.py
           python -c "import timelapse"
+      - name: tester
+        run: pytest -q
 
   bygg:
     needs: sjekk
