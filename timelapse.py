@@ -112,6 +112,11 @@ def load_config(path="config.yaml"):
 # Time helpers
 # ---------------------------------------------------------------------------
 
+# Siste tidspunkt hvert kamera målte uskarpt bilde. Er flere kameraer uskarpe samtidig,
+# er det vær (tåke, dis, snø), ikke linsen — ingen linse mister fokus på to kameraer samtidig.
+_BLUR_SEEN: dict[str, datetime] = {}
+
+
 def local_now(timezone_str):
     return datetime.now(ZoneInfo(timezone_str))
 
@@ -664,7 +669,13 @@ class CameraWorker:
         self._stall_alert_sent: bool = False
         self._stall_ref_time: datetime = self.started_at
         self._blur_streak: int = 0
-        self._focus_ok: bool = True
+        self._blur_since: datetime | None = None        # start på sammenhengende uskarphet
+        self._recover_streak: int = 0
+        self._focus_state: str = "ok"                    # ok | uskarp | uskarp_urettet
+        self._jiggle_times: list[datetime] = []          # zoom-jiggle i dag
+        self._next_jiggle_at: datetime | None = None
+        self._last_sharpness: float | None = None
+        self._last_visibility: float | None = None
         self._last_focus_check: datetime | None = None
         self._focus_inactive_reason: str | None = None  # settes av siste fokussjekk
         self._last_skip: datetime | None = None         # siste planlagte hopp (PTZ i manuell posisjon)
@@ -761,6 +772,16 @@ class CameraWorker:
         }
         if self.cfg.get("focus", {}).get("enabled", False):
             d["focus_status"] = self._focus_status(now)
+            d["focus_detail"] = {
+                "state": self._focus_state,
+                "blur_since": self._blur_since.isoformat() if self._blur_since else None,
+                "blur_minutes": round((now - self._blur_since).total_seconds() / 60) if self._blur_since else 0,
+                "jiggles_today": len([t for t in self._jiggle_times if t.date() == now.date()]),
+                "next_jiggle_at": self._next_jiggle_at.isoformat() if self._next_jiggle_at else None,
+                "sharpness": self._last_sharpness,
+                "visibility": self._last_visibility,
+                "last_check": self._last_focus_check.isoformat() if self._last_focus_check else None,
+            }
 
         fc = self.cfg.get("focus", {})
         d["settings"] = {
@@ -773,6 +794,7 @@ class CameraWorker:
             "stall_minutes": self.cfg.get("stall_alert", {}).get("minutes"),
             "focus":      fc.get("enabled", False),
             "focus_alert_only": fc.get("alert_only", True),
+            "focus_unfixed_after": fc.get("unfixed_after_minutes", 60),
             "focus_interval":   fc.get("interval_minutes"),
             "focus_min_elevation": fc.get("min_sun_elevation", 0),
         }
@@ -785,7 +807,7 @@ class CameraWorker:
         reason = self._focus_inactive_reason
         if reason:
             return f"inaktiv ({reason})"
-        return "ok" if self._focus_ok else "uskarp"
+        return {"ok": "ok", "uskarp": "uskarp", "uskarp_urettet": "uskarp (ikke rettet)"}[self._focus_state]
 
     def _sun_times(self, now: datetime):
         """Returns (sunrise, sunset) or (None, None) if no coordinates configured."""
@@ -1036,7 +1058,7 @@ class CameraWorker:
         self._focus_inactive_reason = reason
 
     def _run_focus_check(self, image_bytes: bytes, now: datetime) -> None:
-        """Analyserer bilde for fokus og oppdaterer _focus_ok / _focus_inactive_reason.
+        """Analyserer bilde for fokus og oppdaterer _focus_state / _focus_inactive_reason.
         Påvirker ikke selve opptaket.
 
         Rekkefølge:
@@ -1050,6 +1072,8 @@ class CameraWorker:
         if self._last_focus_check is not None:
             if (now - self._last_focus_check).total_seconds() / 60 < interval_min:
                 return
+            if now - self._last_focus_check > timedelta(hours=2):
+                self._reset_focus_tracking(now, "pause på over 2 timer")
 
         # --- Tidsbasert ekskludering (kjente problemvinduer, f.eks. lav sol) ---
         for window in fc.get("exclude_hours", []):
@@ -1161,44 +1185,143 @@ class CameraWorker:
 
         lap = (np.roll(roi, 1, 0) + np.roll(roi, -1, 0) +
                np.roll(roi, 1, 1) + np.roll(roi, -1, 1) - 4 * roi)
-        varians = float(lap.var())
+        # np.roll bretter kantene rundt, så ytterste rad/kolonne sammenligner venstre mot høyre kant
+        # og la 5–13 til skarpheten (tåkebilder målte 13 i stedet for 1). Bare det indre teller.
+        varians = float(lap[1:-1, 1:-1].var())
         self._last_focus_check = now
         self._focus_inactive_reason = None
+        self._last_sharpness = round(varians, 1)
+        self._last_visibility = round(hist_stddev, 1)
+        thr = fc.get("focus_threshold", 45.0)
+        alert_only = fc.get("alert_only", True)
 
-        if varians < fc.get("focus_threshold", 45.0):
+        if varians < thr:
             self._blur_streak += 1
+            self._recover_streak = 0
+            if self._blur_since is None:
+                self._blur_since = now
+            _BLUR_SEEN[self.name] = now
+
+            # --- Kryss-kamera: flere kameraer uskarpe samtidig er vær, ikke linse ---
+            window = fc.get("weather_window_minutes", 15)
+            others = [n for n, t in _BLUR_SEEN.items()
+                      if n != self.name and (now - t) <= timedelta(minutes=window)]
+            if window > 0 and others:
+                self._focus_inactive_reason = "dårlig sikt (flere kameraer)"
+                self.log.info(
+                    "Fokus: USKARP (skarphet=%.1f, sikt-stddev=%.1f), men %s er også uskarpt — regnes som vær",
+                    varians, hist_stddev, ", ".join(others),
+                )
+                return
+
+            dur_min = (now - self._blur_since).total_seconds() / 60
             confirm = fc.get("confirm_cycles", 2)
+            confirm_min = fc.get("confirm_minutes", 15)
             self.log.warning(
-                "Fokus: USKARP — skarphet=%.1f, lysnivaa=%.1f, sikt-stddev=%.1f, "
-                "fargemetning=%.1f (syklus %d/%d)",
-                varians, lysnivaa, hist_stddev, fargemetning, self._blur_streak, confirm,
+                "Fokus: USKARP — skarphet=%.1f, lysnivaa=%.1f, sikt-stddev=%.1f, fargemetning=%.1f "
+                "(syklus %d/%d, %.0f/%d min)",
+                varians, lysnivaa, hist_stddev, fargemetning, self._blur_streak, confirm, dur_min, confirm_min,
             )
-            if self._blur_streak >= confirm and self._focus_ok:
-                self._focus_ok = False
-                po = self._global_cfg.get("pushover", {})
-                if po.get("enabled", True) and po.get("token") and po.get("user"):
-                    send_pushover(
-                        po["token"], po["user"],
-                        f"{self.name} — Fokus",
-                        f"Kamera ute av fokus — skarphet={varians:.1f}, lysnivaa={lysnivaa:.1f}",
-                    )
-                if not fc.get("alert_only", True):
-                    self._zoom_jiggle()
-        else:
+            if self._blur_streak < confirm or dur_min < confirm_min:
+                return
+
+            if self._focus_state == "ok":
+                self._focus_state = "uskarp"
+                self.log.warning(
+                    "Fokus: uskarphet bekreftet etter %.0f min — %s",
+                    dur_min, "kun overvåking (alert_only)" if alert_only else "prøver zoom-jiggle",
+                )
+            if not alert_only:
+                self._maybe_jiggle(now, fc)
+
+            unfixed_after = fc.get("unfixed_after_minutes", 60)
+            if self._focus_state == "uskarp" and dur_min >= unfixed_after:
+                self._focus_state = "uskarp_urettet"
+                n_jiggle = len([t for t in self._jiggle_times if t.date() == now.date()])
+                msg = (f"Kamera ute av fokus i {dur_min:.0f} min og lar seg ikke rette — "
+                       f"skarphet={varians:.1f}, {n_jiggle} zoom-jiggle i dag")
+                self.log.error("Fokus: IKKE RETTET — %s", msg)
+                self._notify_focus(msg)
+            return
+
+        # --- Skarpt nok ---
+        if self._focus_state == "ok":
             self._blur_streak = 0
+            self._blur_since = None
             self.log.info(
                 "Fokus: OK — skarphet=%.1f, lysnivaa=%.1f, sikt-stddev=%.1f, fargemetning=%.1f",
                 varians, lysnivaa, hist_stddev, fargemetning,
             )
-            if not self._focus_ok:
-                self._focus_ok = True
-                po = self._global_cfg.get("pushover", {})
-                if po.get("enabled", True) and po.get("token") and po.get("user"):
-                    send_pushover(
-                        po["token"], po["user"],
-                        f"{self.name} — Fokus",
-                        f"Kamera tilbake i fokus — skarphet={varians:.1f}",
-                    )
+            return
+
+        # Hysterese: tilbake først når skarpheten er klart over terskelen, flere ganger på rad
+        recover_at = thr * fc.get("recover_factor", 2.0)
+        if varians < recover_at:
+            self._recover_streak = 0
+            self.log.info(
+                "Fokus: SVAKT — skarphet=%.1f er over %.0f men under %.0f, holder status «%s»",
+                varians, thr, recover_at, self._focus_status(now),
+            )
+            return
+        self._recover_streak += 1
+        need = fc.get("recover_cycles", 2)
+        if self._recover_streak < need:
+            self.log.info("Fokus: bedring — skarphet=%.1f (%d/%d)", varians, self._recover_streak, need)
+            return
+        dur_min = (now - self._blur_since).total_seconds() / 60 if self._blur_since else 0
+        n_jiggle = len([t for t in self._jiggle_times if t.date() == now.date()])
+        was_unfixed = self._focus_state == "uskarp_urettet"
+        self.log.warning(
+            "Fokus: TILBAKE — skarphet=%.1f etter %.0f min uskarpt, %d zoom-jiggle i dag",
+            varians, dur_min, n_jiggle,
+        )
+        if was_unfixed:
+            self._notify_focus(f"Kamera tilbake i fokus — skarphet={varians:.1f} etter {dur_min:.0f} min")
+        self._focus_state = "ok"
+        self._blur_streak = 0
+        self._blur_since = None
+        self._recover_streak = 0
+        self._next_jiggle_at = None
+
+    def _reset_focus_tracking(self, now: datetime, why: str):
+        """Nullstill fokussporingen (ny dag / lang pause): gårsdagens uskarphet skal vurderes på nytt."""
+        if self._focus_state != "ok" or self._blur_since is not None:
+            self.log.info("Fokus: nullstiller sporing (%s), status var «%s»", why, self._focus_state)
+        self._focus_state = "ok"
+        self._blur_streak = 0
+        self._blur_since = None
+        self._recover_streak = 0
+        self._next_jiggle_at = None
+        self._jiggle_times = [t for t in self._jiggle_times if t.date() == now.date()]
+
+    def _maybe_jiggle(self, now: datetime, fc: dict):
+        """Zoom-jiggle med økende ventetid og tak per dag. Kalles bare ved bekreftet uskarphet."""
+        today = [t for t in self._jiggle_times if t.date() == now.date()]
+        self._jiggle_times = today
+        max_per_day = fc.get("jiggle_max_per_day", 4)
+        if self._next_jiggle_at and now < self._next_jiggle_at:
+            return
+        if len(today) >= max_per_day:
+            if self._next_jiggle_at is not None:
+                self.log.warning("Fokus: %d zoom-jiggle i dag, taket er nådd — ingen flere forsøk", len(today))
+                self._next_jiggle_at = None
+            return
+        self._zoom_jiggle()
+        self._jiggle_times.append(now)
+        wait = fc.get("jiggle_wait_minutes", 10) * (2 ** (len(self._jiggle_times) - 1))  # 10, 20, 40, 80 min
+        self._next_jiggle_at = now + timedelta(minutes=wait)
+        self.log.warning(
+            "Fokus: zoom-jiggle %d/%d utført, ny vurdering tidligst om %d min",
+            len(self._jiggle_times), max_per_day, wait,
+        )
+
+    def _notify_focus(self, message: str):
+        """Varsel om fokus som ikke lot seg rette (og når det er tilbake). Kan slås av med focus.notify: false."""
+        if not self.cfg.get("focus", {}).get("notify", True):
+            return
+        po = self._global_cfg.get("pushover", {})
+        if po.get("enabled", True) and po.get("token") and po.get("user"):
+            send_pushover(po["token"], po["user"], f"{self.name} — Fokus", message)
 
 
 # ---------------------------------------------------------------------------
@@ -1224,6 +1347,7 @@ h1 { font-size: 17px; font-weight: 600; }
 .value { color: #ddd; text-align: right; }
 .focus-ok      { color: #2ecc71; }
 .focus-uskarp  { color: #e74c3c; }
+.focus-svak    { color: #f1c40f; }
 .focus-inaktiv { color: #888; }
 .error-msg { margin-top: 4px; padding: 6px 8px; background: #3d1515; border-left: 3px solid #e74c3c; border-radius: 3px; font-size: 12px; color: #ff9999; word-break: break-word; }
 .badge { padding: 2px 9px; border-radius: 10px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
@@ -1250,7 +1374,7 @@ function buildTags(s) {
   t += tag('timelapse', s.timelapse, 'Genererer rullende timelapse-video hver time');
   t += tag('FTP', s.ftp, 'Siste bilde lastes opp via FTP etter hvert opptak');
   if (s.focus) {
-    var fmode = s.focus_alert_only ? 'Sender Pushover-varsel ved uskarphet' : 'Kjører zoom-jiggle for å gjenopprette fokus';
+    var fmode = (s.focus_alert_only ? 'Kun overvåking ved uskarphet' : 'Kjører zoom-jiggle for å gjenopprette fokus') + '. Varsler først etter ' + (s.focus_unfixed_after || 60) + ' min uten bedring';
     t += tag('fokus ' + (s.focus_alert_only ? 'alert' : 'jiggle') + ' ' + s.focus_interval + 'min', true, 'Fokussjekk hvert ' + s.focus_interval + ' min. ' + fmode + '. Inaktiv om natten, i nattmodus (svart/hvitt) og når solen står under ' + (s.focus_min_elevation || 0) + '°.');
   } else {
     t += tag('fokus', false, 'Fokussjekk er ikke aktivert');
@@ -1293,7 +1417,8 @@ async function refresh() {
       if (frow) {
         if (cam.focus_status) {
           var cls = cam.focus_status === 'ok' ? 'focus-ok'
-                  : cam.focus_status === 'uskarp' ? 'focus-uskarp'
+                  : cam.focus_status.indexOf('ikke rettet') >= 0 ? 'focus-uskarp'
+                  : cam.focus_status === 'uskarp' ? 'focus-svak'
                   : 'focus-inaktiv';
           frow.querySelector('.val-focus').className = 'value val-focus ' + cls;
           frow.querySelector('.val-focus').textContent = cam.focus_status;
@@ -1480,8 +1605,8 @@ class HealthHandler(BaseHTTPRequestHandler):
                 self._simple(200, "Focus disabled")
                 return
             focus_status = h.get("focus_status", "ok")
-            # inaktiv = natt eller solnedgang-vindu, ikke en feil
-            if focus_status == "uskarp":
+            # inaktiv = natt/vær, ikke feil; «uskarp» håndteres fortsatt (jiggle) og er heller ikke feil ennå
+            if focus_status.startswith("uskarp (ikke rettet)"):
                 self._simple(503, focus_status)
             else:
                 self._simple(200, focus_status)

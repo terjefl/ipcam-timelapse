@@ -172,7 +172,7 @@ Brukes for Reolink PTZ-kameraer. Tjenesten beveger kameraet til en lagret preset
 
 #### Fokusovervåking
 
-Analyserer bildeskarpheten og varsler via Pushover hvis kameraet mister fokus. Bruker tostegs-deteksjon for å skille mellom uskarp linse og dårlig sikt (tåke, dis, motlys). Fokussjekken påvirker aldri selve opptaket — bildet lagres og lastes opp uansett resultat.
+Analyserer bildeskarpheten, retter fokus selv med zoom-jiggle, og varsler først når det ikke lot seg rette innen rimelig tid. Bruker tostegs-deteksjon for å skille mellom uskarp linse og dårlig sikt (tåke, dis, motlys). Fokussjekken påvirker aldri selve opptaket — bildet lagres og lastes opp uansett resultat.
 
 ```yaml
     focus:
@@ -181,8 +181,16 @@ Analyserer bildeskarpheten og varsler via Pushover hvis kameraet mister fokus. B
       focus_threshold: 20.0        # Laplacian-varians; under denne = uskarp
       light_threshold: 30.0        # Lysnivå under denne = natt, hopp over sjekk
       colour_threshold: 2.0        # Fargemetning under denne = svart/hvitt nattmodus (IR), hopp over sjekk
-      confirm_cycles: 2            # Antall påfølgende uskarpe frames før varsel
-      alert_only: true             # false = kjør zoom-jiggle for å gjenopprette fokus
+      confirm_cycles: 2            # Minst N påfølgende uskarpe sjekker ...
+      confirm_minutes: 15          # ... og minst N min sammenhengende før uskarpheten regnes som bekreftet
+      alert_only: false            # false = zoom-jiggle ved bekreftet uskarphet; true = bare overvåk
+      jiggle_wait_minutes: 10      # Ventetid etter første jiggle; dobles per forsøk (10, 20, 40, 80)
+      jiggle_max_per_day: 4        # Maks zoom-jiggle per dag
+      unfixed_after_minutes: 60    # Uskarpt så lenge uten bedring = «uskarp (ikke rettet)» → 503 og varsel
+      recover_factor: 2.0          # Tilbake først når skarpheten er over focus_threshold * N ...
+      recover_cycles: 2            # ... i N påfølgende sjekker (hysterese)
+      weather_window_minutes: 15   # Annet kamera også uskarpt innen N min = vær, ikke linse (0 = av)
+      notify: true                 # Pushover ved «ikke rettet» og når fokus er tilbake
       visibility_threshold: 0.0    # Histogram-stddev under denne = tåke/dis, hopp over (0 = av)
       roi_fraction: 0.6            # Bruk sentrum N% av bildet (1.0 = hele bildet)
       min_sun_elevation: 3         # Deaktiver når solen står lavere enn N grader, morgen og kveld (0 = av)
@@ -196,6 +204,19 @@ Analyserer bildeskarpheten og varsler via Pushover hvis kameraet mister fokus. B
         password: passord
         channel: 0
 ```
+
+**Forløp ved uskarphet.** Én måling under terskelen gjør ingenting. Først når bildet har vært uskarpt i
+`confirm_cycles` sjekker *og* `confirm_minutes` minutter sammenhengende, regnes uskarpheten som bekreftet
+(status `uskarp`). Da kjøres zoom-jiggle (med mindre `alert_only: true`), og det ventes `jiggle_wait_minutes`
+før neste forsøk, med dobling for hvert forsøk og tak på `jiggle_max_per_day`. Hjelper ingenting innen
+`unfixed_after_minutes`, settes status `uskarp (ikke rettet)`: `/health/<kamera>/focus` gir 503 og ett
+Pushover-varsel sendes. Status går tilbake til `ok` først når skarpheten er over `focus_threshold * recover_factor`
+i `recover_cycles` sjekker på rad, så lett dis ikke gir vipping fram og tilbake. En pause på over to timer
+(natt) nullstiller sporingen, så gårsdagens uskarphet vurderes på nytt neste morgen.
+
+**Vær, ikke linse** (`weather_window_minutes`): Er flere kameraer uskarpe innenfor samme vindu, regnes det som
+tåke eller dis, status blir `inaktiv (dårlig sikt (flere kameraer))` og ingenting gjøres. Ingen linse mister fokus
+på to kameraer samtidig.
 
 **Siktsjekk** (`visibility_threshold`): Lavt standardavvik på histogrammet betyr et uniformt, flatt bilde — typisk tåke, dis eller motlys. Fokussjekken hoppes da over for å unngå falske varsler. Typiske verdier: klart vær ~40–80, lett dis ~20–35, tett tåke <15.
 
@@ -277,7 +298,7 @@ Alle returnerer `200 OK` eller `503 Service Unavailable` med en kort tekstmeldin
 
 **Planlagte hopp er ikke feil.** Når PTZ-bildesjekken finner at kameraet står i manuell posisjon, telles hoppet som aktivitet: status blir `paused`, og verken `/health`, capture-endepunktet eller stall-varselet slår ut. Feil gis først når override-grensen passeres uten bilde.
 
-**Fokus-endepunktet** returnerer 200 også når fokussjekken er inaktiv (natt, nattmodus, lav sol, dårlig sikt). Kun bekreftet uskarp linse gir 503.
+**Fokus-endepunktet** returnerer 200 også når fokussjekken er inaktiv (natt, nattmodus, lav sol, dårlig sikt) og mens uskarphet håndteres med zoom-jiggle (`uskarp`). Kun `uskarp (ikke rettet)` gir 503. `/health` har i tillegg `focus_detail` per kamera med tilstand, hvor lenge bildet har vært uskarpt, antall jiggle i dag og siste skarphets- og siktverdi.
 
 **Feilmeldinger** i `last_error`, logg og dashbord maskeres for `user=`, `password=` og `token=` i URL-er, slik at kamerapassordet i snapshot-URL-en ikke lekker ut via port 8080.
 

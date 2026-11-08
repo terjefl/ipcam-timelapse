@@ -88,8 +88,16 @@ cameras:
       interval_minutes: 5      # sjekk fokus hvert N-te minutt
       focus_threshold: 20.0    # Laplacian-varians; under denne = uskarp
       light_threshold: 30.0    # lysnivå under denne = natt, hopp over sjekk
-      confirm_cycles: 2        # antall påfølgende uskarpe frames før varsel/jiggle
-      alert_only: true         # true = kun varsle; false = kjør zoom-jiggle ved uskarphet
+      confirm_cycles: 2        # minst N påfølgende uskarpe sjekker ...
+      confirm_minutes: 15      # ... og minst N minutter sammenhengende uskarpt før det regnes som bekreftet
+      alert_only: false        # false = kjør zoom-jiggle ved bekreftet uskarphet; true = bare overvåk
+      jiggle_wait_minutes: 10  # ventetid etter første jiggle; dobles for hvert forsøk (10, 20, 40, 80)
+      jiggle_max_per_day: 4    # maks antall zoom-jiggle per dag
+      unfixed_after_minutes: 60  # uskarpt så lenge uten bedring = «uskarp (ikke rettet)»: 503 på /health/<kamera>/focus og varsel
+      recover_factor: 2.0      # tilbake i fokus først når skarpheten er over focus_threshold * N ...
+      recover_cycles: 2        # ... i N påfølgende sjekker (hysterese mot vipping i dis)
+      weather_window_minutes: 15  # er et annet kamera også uskarpt innen N min, regnes det som vær (0 = av)
+      notify: true             # Pushover-varsel når fokus ikke lot seg rette, og når det er tilbake
       visibility_threshold: 20  # histogram-stddev under denne = tåke/dis/motlys, hopp over fokussjekk (0 = deaktivert; typisk 20–30)
       roi_fraction: 0.6          # bruk sentrum N% av bildet for fokussjekk (1.0 = hele bildet)
       min_sun_elevation: 3       # hopp over fokussjekk når solen står lavere enn N grader (morgen og kveld); 0 = deaktivert
@@ -163,8 +171,16 @@ cameras:
       interval_minutes: 5      # sjekk fokus hvert N-te minutt
       focus_threshold: 20.0    # Laplacian-varians; under denne = uskarp
       light_threshold: 30.0    # lysnivå under denne = natt, hopp over sjekk
-      confirm_cycles: 2        # antall påfølgende uskarpe frames før varsel/jiggle
-      alert_only: true         # true = kun varsle; false = kjør zoom-jiggle ved uskarphet
+      confirm_cycles: 2        # minst N påfølgende uskarpe sjekker ...
+      confirm_minutes: 15      # ... og minst N minutter sammenhengende uskarpt før det regnes som bekreftet
+      alert_only: false        # false = kjør zoom-jiggle ved bekreftet uskarphet; true = bare overvåk
+      jiggle_wait_minutes: 10  # ventetid etter første jiggle; dobles for hvert forsøk (10, 20, 40, 80)
+      jiggle_max_per_day: 4    # maks antall zoom-jiggle per dag
+      unfixed_after_minutes: 60  # uskarpt så lenge uten bedring = «uskarp (ikke rettet)»: 503 på /health/<kamera>/focus og varsel
+      recover_factor: 2.0      # tilbake i fokus først når skarpheten er over focus_threshold * N ...
+      recover_cycles: 2        # ... i N påfølgende sjekker (hysterese mot vipping i dis)
+      weather_window_minutes: 15  # er et annet kamera også uskarpt innen N min, regnes det som vær (0 = av)
+      notify: true             # Pushover-varsel når fokus ikke lot seg rette, og når det er tilbake
       visibility_threshold: 20  # histogram-stddev under denne = tåke/dis/motlys, hopp over fokussjekk (0 = deaktivert; typisk 20–30)
       roi_fraction: 0.6          # bruk sentrum N% av bildet for fokussjekk (1.0 = hele bildet)
       min_sun_elevation: 3       # hopp over fokussjekk når solen står lavere enn N grader (morgen og kveld); 0 = deaktivert
